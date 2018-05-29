@@ -35,10 +35,19 @@ const unsigned int position_data_length = 80;
 float position_data[position_data_length];
 unsigned int position_data_index;
 unsigned int position_data_is_ready;
-const float POSITION_DATA_HORIZONTAL_TILT_THRESHOLD_CONST = 4.0; 
-const float POSITION_DATA_VERTICAL_TILT_THRESHOLD_CONST = 8.0; 
+const float POSITION_HORIZONTAL_TILT_THRESHOLD_CONST = 4.0;
+const float POSITION_VERTICAL_TILT_THRESHOLD_CONST = 8.0;
 bool is_horizontal_position = false;
 unsigned long fall_detect_occurance_timestamp = 0;
+
+float global_accel_vector_modulus_low_pass = 0.0;
+bool is_impact_detection_active = true;
+const float IMPACT_UPPER_LIMIT_THRESHOLD_CONST = 16.0;
+const float IMPACT_LOWER_LIMIT_THRESHOLD_CONST = -8.0;
+bool pre_impact_detected = false;
+unsigned long pre_impact_detection_timestamp = 0;
+bool impact_detected = false;
+unsigned long impact_detection_timestamp = 0;
 
 
 void setup() 
@@ -60,7 +69,7 @@ void setup()
     sensor.init();
     sensor.enableDefault();
  
-    reset_position_data();    
+    reset_position_data();
 }
 
 void loop()
@@ -71,7 +80,10 @@ void loop()
         bool is_auto_fall = detect_fall();
         bool simulate_fall = (uint8_t) digitalRead(fall_detection_pin) == HIGH;
         bool is_manual_fall = (uint8_t) digitalRead(user_input_pin_1) == HIGH || simulate_fall;
-        fallDetectionHandler(is_manual_fall || is_auto_fall);
+        
+        // is_auto_fall = false;
+
+        handle_fall_detection(is_manual_fall || is_auto_fall);
         return;
     }
     if (is_help_message_sent)
@@ -161,7 +173,7 @@ void loop()
     }
 }
 
-void fallDetectionHandler(bool is_fall)
+void handle_fall_detection(bool is_fall)
 {
     // Fall detection handler
     if (!is_fall_detected && is_fall)
@@ -177,7 +189,7 @@ void fallDetectionHandler(bool is_fall)
     if (is_fall_detected)
     {
         // Wait for warning timeout
-        if ((unsigned long) (millis() - fall_warning_start_timestamp) >= 5000)
+        if ((unsigned long) (millis() - fall_warning_start_timestamp) >= 10000)
         {            
             Serial.print("no user response. Fall might have occured.\n");
             digitalWrite(fall_warning_led_pin, HIGH);
@@ -185,7 +197,7 @@ void fallDetectionHandler(bool is_fall)
             is_fall_detected = false;
             is_sending_help_message = true;
 
-            bluetooth_serial.print("<AGAPI=HELP+TEMPERATURE=69>\n");  /////////////////////////
+            bluetooth_serial.print("<AGAPI=HELP+TEMPERATURE=69>\n");
 
             waiting_response = true;
             Serial.print("need to send help msg.\n");
@@ -201,7 +213,7 @@ void fallDetectionHandler(bool is_fall)
                 is_fall_detected = false;
                 is_sending_help_message = true;
 
-                bluetooth_serial.print("<AGAPI=HELP+TEMPERATURE=69>\n");  ////////////////////////////////
+                bluetooth_serial.print("<AGAPI=HELP+TEMPERATURE=69>\n");
 
                 waiting_response = true;
                 Serial.print("need to send help msg.\n");
@@ -265,36 +277,75 @@ bool detect_fall()
     // * constants for the maximum range of +/-16G = 0.732mG/LSB (got it from the LSM303 datasheet);
     // * G's are calculated by using this formula: G = raw*const, const = 0.000732G/LSB;
     const float LSM303_const_val = (float)(0.000732);   // a value used for converting raw accel data to G's
+    float x_G = sensor.a.x * LSM303_const_val;
     float y_G = sensor.a.y * LSM303_const_val;
+    float z_G = sensor.a.z * LSM303_const_val;
 
     // Get the average value of the position
     float position_data_average = get_position_data_average(abs(y_G));
 
-    // Serial.println(String(position_data_average));
+    // Get acceleration vector modulus
+    float accel_vector_modulus = sqrt(x_G * x_G + y_G * y_G + z_G * z_G);  // |a| = sqrt(x_G^2 + y_G^2 + z_G^2)
 
-    // Fall detection
-    if (position_data_is_ready) 
+    // Apply low-pass filter to acceleration value
+    global_accel_vector_modulus_low_pass = 0.9 * global_accel_vector_modulus_low_pass + 0.1 * accel_vector_modulus;
+    accel_vector_modulus -= global_accel_vector_modulus_low_pass;
+    // Serial.print("A=" + String(accel_vector_modulus) + "\n");
+
+    if (is_impact_detection_active)
+    {
+        if (accel_vector_modulus >= IMPACT_UPPER_LIMIT_THRESHOLD_CONST && !pre_impact_detected && !impact_detected)
+        {
+            // Detect fall pre-impact
+            pre_impact_detection_timestamp = millis();
+            pre_impact_detected = true;
+            Serial.print("pre impact detected\n");
+        } 
+        else if (accel_vector_modulus <= IMPACT_LOWER_LIMIT_THRESHOLD_CONST && pre_impact_detected && !impact_detected)
+        {
+            // Detect fall impact
+            impact_detection_timestamp = millis();
+            pre_impact_detected = false;
+            impact_detected = true;
+            Serial.print("impact detected\n");
+        }
+
+        if (impact_detected && (unsigned long) (millis() - impact_detection_timestamp) >= 5000)
+        {
+            Serial.print("activating another\n");
+            impact_detected = false;
+            is_impact_detection_active = false;
+        }
+        else if (pre_impact_detected && (unsigned long) (millis() - pre_impact_detection_timestamp) >= 1000)
+        {
+            pre_impact_detected = false;
+        }       
+        return false;
+    }
+
+    // Fall position detection
+    if (!is_impact_detection_active && position_data_is_ready)
     {    
-        if (position_data_average <= POSITION_DATA_HORIZONTAL_TILT_THRESHOLD_CONST && !is_horizontal_position)
+        if (!is_horizontal_position && position_data_average <= POSITION_HORIZONTAL_TILT_THRESHOLD_CONST)
         {
             is_horizontal_position = true;
             fall_detect_occurance_timestamp = millis();
             Serial.println("user is now horizontal");
-        }
-        if (is_horizontal_position)
+        } 
+        else if (position_data_average >= POSITION_VERTICAL_TILT_THRESHOLD_CONST)
         {
-            if (position_data_average >= POSITION_DATA_VERTICAL_TILT_THRESHOLD_CONST)
-            {
-                is_horizontal_position = false;
-                Serial.println("user is now vertical");
-                return false;
-            } else if ((unsigned long) (millis() - fall_detect_occurance_timestamp) >= 10000) 
-            {
-                reset_position_data();
-                is_horizontal_position = false;
-                return true;
-            }
+            is_impact_detection_active = true;
+            is_horizontal_position = false;
+            Serial.println("user is now vertical");
+            return false;
+        } 
+        if (is_horizontal_position && (unsigned long) (millis() - fall_detect_occurance_timestamp) >= 10000) 
+        {
+            is_impact_detection_active = true;
+            reset_position_data();
+            is_horizontal_position = false;
+            return true;
         }
     }
-    return false;
+    return false;    
 }
